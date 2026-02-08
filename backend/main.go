@@ -10,101 +10,105 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-type Message struct {
+type ChatMessage struct {
 	Type  string   `json:"type"`
 	User  string   `json:"user"`
 	Text  string   `json:"text"`
 	Users []string `json:"users"`
 }
 
-type Client struct {
-	conn *websocket.Conn
-	user string
-	id   string
+type ChatClient struct {
+	connection *websocket.Conn
+	username   string
+	clientID   string
 }
 
 var (
-	clients  = make(map[*Client]bool)
-	mu       sync.Mutex
-	upgrader = websocket.Upgrader{
+	activeClients = make(map[*ChatClient]bool)
+	clientsLock   sync.Mutex
+
+	wsUpgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
 )
 
 func main() {
-	r := gin.Default()
+	router := gin.Default()
 
-	r.GET("/ws", wsHandler)
-	r.GET("/", func(c *gin.Context) {
-		c.File("../frontend/index.html")
-	})
-	r.Static("/static", "../frontend")
+	router.GET("/ws", handleWebSocket)
+	router.GET("/", serveIndexPage)
+	router.Static("/static", "../frontend")
 
-	log.Println("Running on :8080")
-	r.Run(":8080")
+	log.Println("Server running on :8080")
+	router.Run(":8080")
 }
 
-func wsHandler(c *gin.Context) {
-	ws, _ := upgrader.Upgrade(c.Writer, c.Request, nil)
+func serveIndexPage(c *gin.Context) {
+	c.File("../frontend/index.html")
+}
 
-	client := &Client{
-		conn: ws,
-		id:   uuid.NewString(),
+func handleWebSocket(c *gin.Context) {
+	wsConn, _ := wsUpgrader.Upgrade(c.Writer, c.Request, nil)
+
+	client := &ChatClient{
+		connection: wsConn,
+		clientID:   uuid.NewString(),
 	}
 
-	mu.Lock()
-	clients[client] = true
-	mu.Unlock()
+	clientsLock.Lock()
+	activeClients[client] = true
+	clientsLock.Unlock()
 
-	sendUsers()
+	sendActiveUsers()
 
 	defer func() {
-		mu.Lock()
-		delete(clients, client)
-		mu.Unlock()
-		sendUsers()
-		ws.Close()
+		clientsLock.Lock()
+		delete(activeClients, client)
+		clientsLock.Unlock()
+
+		sendActiveUsers()
+		wsConn.Close()
 	}()
 
 	for {
-		var msg Message
-		if ws.ReadJSON(&msg) != nil {
+		var incomingMsg ChatMessage
+		if wsConn.ReadJSON(&incomingMsg) != nil {
 			break
 		}
 
-		switch msg.Type {
+		switch incomingMsg.Type {
 		case "join":
-			client.user = msg.User
-			sendUsers()
+			client.username = incomingMsg.User
+			sendActiveUsers()
+
 		case "message":
-			broadcast(msg)
+			broadcastMessage(incomingMsg)
 		}
 	}
 }
 
-func broadcast(msg Message) {
-	mu.Lock()
-	defer mu.Unlock()
+func broadcastMessage(msg ChatMessage) {
+	clientsLock.Lock()
+	defer clientsLock.Unlock()
 
-	for c := range clients {
-		c.conn.WriteJSON(msg)
+	for client := range activeClients {
+		client.connection.WriteJSON(msg)
 	}
 }
 
-func sendUsers() {
-	var list []string
+func sendActiveUsers() {
+	var usernames []string
 
-	mu.Lock()
-	for c := range clients {
-		if c.user != "" {
-			list = append(list, c.user)
+	clientsLock.Lock()
+	for client := range activeClients {
+		if client.username != "" {
+			usernames = append(usernames, client.username)
 		}
 	}
-	mu.Unlock()
+	clientsLock.Unlock()
 
-	broadcast(Message{
+	broadcastMessage(ChatMessage{
 		Type:  "users",
-		Users: list,
+		Users: usernames,
 	})
 }
-
